@@ -115,6 +115,7 @@ final class Runner: @unchecked Sendable {
     @Published var importPlan:ImportPlan?
     @Published var importing = false
     let runner = Runner()
+    private var readingsMonitorID = ""
     func record(_ message:String) {
         log += "[\(Date().formatted(date:.omitted,time:.standard))] \(message)\n"
         if log.count > 100000 { log = String(log.suffix(100000)) }
@@ -128,10 +129,17 @@ final class Runner: @unchecked Sendable {
         guard result.code == 0, nums.count == 2 else { return nil }
         return Reading(current:nums[0],maximum:nums[1])
     }
-    func refresh() async {
-        guard !busy else { return }; busy = true; defer { busy = false }
+    func refresh(group:String = "画面") async {
+        // Page changes cancel the previous refresh; wait for its in-flight DDC request.
+        while busy {
+            do { try await Task.sleep(nanoseconds:50_000_000) } catch { return }
+        }
+        guard !Task.isCancelled else { return }
+        busy = true; defer { busy = false }
+        let started = Date()
         status = "正在检测连接…"
         let result = await execute(["display","list"])
+        guard !Task.isCancelled else { return }
         var found:[Monitor] = []
         let regex = try! NSRegularExpression(pattern:"^\\[\\d+\\] (.+) \\(([A-Fa-f0-9-]+)\\)$")
         for line in result.text.components(separatedBy:"\n") {
@@ -147,19 +155,30 @@ final class Runner: @unchecked Sendable {
             rememberedName = monitor.name
             UserDefaults.standard.set(selected,forKey:"selectedMonitor"); UserDefaults.standard.set(rememberedName,forKey:"monitorName")
         }
-        readings = [:]; failures = []; extraCodes = []
+        if readingsMonitorID != selected { readings = [:]; failures = []; extraCodes = []; capabilities = "尚未读取"; readingsMonitorID = selected }
         record("设备检测：\(result.text)")
-        guard found.contains(where:{$0.id == selected}) else { status = "显示器未连接 · 可以尝试唤醒"; capabilities = "设备离线"; return }
+        guard found.contains(where:{$0.id == selected}) else { readings = [:]; failures = []; status = "显示器未连接 · 可以尝试唤醒"; capabilities = "设备离线"; return }
         let id = selected
-        let caps = await execute(["display",id,"caps"])
-        capabilities = caps.code == 0 ? caps.text : "显示器没有返回有效的能力清单；以下项目通过逐项读取检测。"
-        for f in features {
-            status = "正在读取\(f.name)…"
+        let pageFeatures = features.filter { $0.group == group }
+        for (index,f) in pageFeatures.enumerated() {
+            guard !Task.isCancelled else { return }
+            status = "正在读取\(group) · \(index+1)/\(pageFeatures.count)…"
             let r = await execute(["display",id,"probe",f.hex])
-            if let v = reading(r) { readings[f.code] = v } else { failures.insert(f.code) }
+            guard !Task.isCancelled else { return }
+            if let v = reading(r) { readings[f.code] = v; failures.remove(f.code) }
+            else { readings.removeValue(forKey:f.code); failures.insert(f.code) }
         }
-        status = "已连接 · \(readings.count) 项可读取"
-        record("检测完成，\(readings.count) 项可读取。读取成功不代表当前模式允许所有写入值。")
+        let count = pageFeatures.filter { readings[$0.code] != nil }.count
+        status = pageFeatures.isEmpty ? "已连接" : "\(group)已更新 · \(count)/\(pageFeatures.count) 项可读取"
+        record("\(status)，用时 \(String(format:"%.1f",Date().timeIntervalSince(started))) 秒。")
+    }
+    func readCapabilities() async {
+        guard !busy else { return }; busy = true; defer { busy = false }
+        status = "正在读取能力清单…"
+        let r = await execute(["display",selected,"caps"])
+        capabilities = r.code == 0 ? r.text : "显示器未返回有效能力清单；不影响按已确认的控制码读取设置。"
+        status = r.code == 0 ? "能力清单已读取" : "能力清单不可用"
+        record(status)
     }
     func write(_ code:Int,_ value:Int) async {
         guard !busy else { return }; busy = true; defer { busy = false }
@@ -246,9 +265,9 @@ struct ContentView: View {
                     VStack(alignment:.leading,spacing:5) { Text(model.rememberedName).font(.title.bold()); Text("\(model.monitors.contains(where:{$0.id == model.selected}) ? "USB-C / DisplayPort" : "上次连接的显示器")").font(.caption).foregroundStyle(.secondary) }
                     Spacer()
                     if model.monitors.count > 1 {
-                        Picker("显示器",selection:$model.selected){ForEach(model.monitors){m in Text(m.name).tag(m.id)}}.labelsHidden().frame(width:150).disabled(model.busy).onChange(of:model.selected){Task{await model.refresh()}}
+                        Picker("显示器",selection:$model.selected){ForEach(model.monitors){m in Text(m.name).tag(m.id)}}.labelsHidden().frame(width:150).disabled(model.busy).onChange(of:model.selected){Task{await model.refresh(group:page)}}
                     }
-                    Button {Task{await model.refresh()}} label:{Image(systemName:"arrow.clockwise")}.disabled(model.busy).help("重新检测与读取")
+                    Button {Task{await model.refresh(group:page)}} label:{Image(systemName:"arrow.clockwise")}.disabled(model.busy).help("重新检测连接并读取当前页面")
                     Button {Task{await model.wake()}} label:{Label("唤醒显示器",systemImage:"power")}.buttonStyle(.borderedProminent).tint(.teal).disabled(model.busy)
                 }.padding(24)
                 Divider()
@@ -286,6 +305,7 @@ struct ContentView: View {
                         else if page == "设备信息" {
                             Text("这里是显示器通过 DDC 返回的原始信息，固件字段不一定等于菜单里的版本号。").foregroundStyle(.secondary)
                             ForEach(features.filter{$0.group == "设备信息"}) {f in valueRow(f)}
+                            Button("读取能力清单"){Task{await model.readCapabilities()}}.disabled(model.busy)
                             GroupBox("能力清单") {Text(model.capabilities).font(.system(.caption,design:.monospaced)).textSelection(.enabled).frame(maxWidth:.infinity,alignment:.leading)}
                         } else {
                             HStack {Text("记录保存在本次会话中，可导出用于排查。").foregroundStyle(.secondary);Spacer();Button("导出日志"){model.export()}}
@@ -297,7 +317,7 @@ struct ContentView: View {
                 HStack(spacing:10) {if model.busy {ProgressView().controlSize(.small)} else {Image(systemName:"info.circle").foregroundStyle(.teal)};Text(model.status).font(.caption).lineLimit(2);Spacer()}.padding(14)
             }
         }.frame(minWidth:860,minHeight:620)
-        .task{await model.refresh()}
+        .task(id:page){await model.refresh(group:page)}
         .sheet(item:$model.importPlan){plan in ImportPreview(model:model,plan:plan)}
         .alert(item:$pending) {p in Alert(title:Text("确认修改显示器设置"),message:Text(p.message),primaryButton:.default(Text("发送指令")){Task{await model.write(p.code,p.value)}},secondaryButton:.cancel(Text("取消")))}
     }

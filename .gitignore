@@ -1,0 +1,8 @@
+build/
+.DS_Store
+backend/.objects/
+backend/m1ddc
+*.zip
+*.app/
+Backups/
+KTC-配置-*.json
